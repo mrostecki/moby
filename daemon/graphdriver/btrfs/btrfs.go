@@ -70,7 +70,60 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		return nil, graphdriver.ErrPrerequisites
 	}
 
-	if err := idtools.MkdirAllAndChown(home, 0701, idtools.CurrentIdentity()); err != nil {
+	// Ensure that home directory exists and is a btrfs subvolume.
+	homePrefix, homeSuffix := filepath.Split(home)
+	sv, err := isSubvolume(home)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			// If home directory does not exist, create the subvolume.
+			if err := subvolCreate(homePrefix, homeSuffix); err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	} else if !sv {
+		// Home directory exists but it's not a parent btrfs subvolume,
+		// which most likely means that it was used previously, but is
+		// a part of the rootfs subvolume and the per-container
+		// subvolumes are its children.
+		// Fix that by creating the home directory as a subvolume and
+		// migrating all old /var/lib/docker/btrfs/subvolumes/* there.
+
+		// Move the old home directory in a different location.
+		homeBak := home + ".bak"
+		if err := os.Rename(home, homeBak); err != nil {
+			return nil, err
+		}
+
+		// Create the new subvolume.
+		if err := subvolCreate(homePrefix, homeSuffix); err != nil {
+			return nil, err
+		}
+
+		// Move the old content to the new subvolume.
+		content, err := ioutil.ReadDir(homeBak)
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range content {
+			src := filepath.Join(homeBak, f.Name())
+			dst := filepath.Join(home, f.Name())
+			if err := os.Rename(src, dst); err != nil {
+				return nil, err
+			}
+		}
+
+		// Remove the temporary bak location.
+		if err := os.Remove(homeBak); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := os.Chown(home, os.Getuid(), os.Getegid()); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(home, 0701); err != nil {
 		return nil, err
 	}
 
